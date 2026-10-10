@@ -741,6 +741,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
+        ggml_tensor **                          sel_idx_out,
         int *                                   sections,
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
@@ -820,21 +821,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     ggml_build_forward_expand(gf, sel_idx);
 
-    // TODO: figure out to reduce the large copmute buffer that this creates
-
-    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
-    // seeding from sel_idx ties the scatter storage lifetime to this layer
     const int64_t n_kv = inp_kpool->n_kv;
-
-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
-
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
-    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     // live slots address disjoint cells, but padded pools and missing tail cells share the n_kv sentinel, and
     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
@@ -847,6 +834,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
     live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
     ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
+
+    // Feed the same selected columns to native Vulkan FA without scattering and re-scanning a dense mask.
+    if (sel_idx_out) {
+        ggml_tensor * idx_live = ggml_scale_bias(ctx0, ggml_cast(ctx0, sel_idx, GGML_TYPE_F32), 1.0f, 1.0f);
+        idx_live = ggml_scale_bias(ctx0, ggml_mul(ctx0, idx_live, live), 1.0f, -1.0f);
+        *sel_idx_out = ggml_cast(ctx0, idx_live, GGML_TYPE_I32);
+        cb(*sel_idx_out, "indexer_sel_idx", il);
+        return kq_mask;
+    }
+
+    // Scatter storage is only needed by the original dense-mask path.
+    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + n_sel, 1, 1, 1);
+    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
+    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, n_sel, 1, 1, 1);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+    zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
 
     // dump rows n_kv + slot as a cumulative sum: the meta backend cannot split an arange, which has no source
     ggml_tensor * dump  = ggml_scale_bias(ctx0, ggml_cumsum(ctx0, ggml_fill(ctx0, live, 1.0f)), 1.0f, (float) (n_kv - 1));
@@ -873,6 +880,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
         ggml_tensor *             sel,
+        ggml_tensor *             sel_idx,
         int64_t                   n_sel,
         float                     kq_scale,
         int                       il) {
@@ -914,7 +922,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, mask, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, mask, nullptr, nullptr, n_sel, kq_scale, il, sel_idx);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -939,7 +947,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    ggml_tensor * sel_idx = nullptr;
+    bool use_indices = false;
+    if (qsa && cparams.flash_attn && n_tokens <= 8 && inp_kpool->n_kv >= 65536 &&
+            !getenv("LLAMA_QSA_INDICES_DISABLE") && !getenv("GGML_VK_FA_SPARSE_DISABLE")) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0) {
+            ggml_tensor * q_probe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd_head, n_tokens, n_head, 1);
+            ggml_tensor * k_probe = ggml_permute(ctx0, inp->mctx->get_k(ctx0, il), 0, 2, 1, 3);
+            ggml_tensor * v_probe = inp->mctx->get_v(ctx0, il);
+            const bool v_trans = v_probe->nb[1] > v_probe->nb[2];
+            v_probe = ggml_permute(ctx0, v_probe, 0, 2, 1, 3);
+            if (v_trans) {
+                v_probe = ggml_transpose(ctx0, v_probe);
+            }
+            if (k_probe->ne[3] == 1 && v_probe->ne[3] == 1 &&
+                    (k_probe->type == GGML_TYPE_F16 || k_probe->type == GGML_TYPE_Q8_0) &&
+                    (v_probe->type == GGML_TYPE_F16 || v_probe->type == GGML_TYPE_Q8_0)) {
+                ggml_tensor * probe = ggml_flash_attn_ext(ctx0, q_probe, k_probe, v_probe, inp->get_kq_mask(),
+                        1.0f, hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                ggml_prec_set_acc(probe, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_kv_indices(probe,
+                        ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp_kpool->n_sel, n_tokens));
+                use_indices = ggml_backend_dev_supports_op(dev, probe);
+            }
+        }
+    }
+    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(),
+            use_indices ? &sel_idx : nullptr, sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -992,7 +1027,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (sel) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, inp_kpool->n_sel, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, sel, sel_idx, inp_kpool->n_sel, kq_scale, il);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,

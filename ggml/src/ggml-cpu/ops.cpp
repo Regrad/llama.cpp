@@ -8852,6 +8852,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * indices = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8963,7 +8964,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int32_t * columns = indices ? (const int32_t *) ((const char *) indices->data + iq1*indices->nb[1]) : nullptr;
+        for (int64_t slot = ic_start; slot < ic_end; ++slot) {
+            const int64_t ic = columns ? columns[slot] : slot;
+            if (ic < 0 || ic >= nek1) {
+                continue;
+            }
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9486,7 +9492,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !dst->src[5] && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9543,7 +9549,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !dst->src[5] && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9565,7 +9571,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0,
+                        dst->src[5] ? dst->src[5]->ne[0] : nek1, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);

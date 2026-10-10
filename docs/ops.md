@@ -2,6 +2,9 @@
 
 List of GGML operations and backend support status.
 
+Private local extension: [indexed Flash Attention](ops/flash-attn-indices.md)
+is supported by the modified CPU/Vulkan backends only; ordinary FA is unchanged.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

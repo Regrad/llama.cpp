@@ -8037,6 +8037,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 }
 
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    const ggml_tensor * indices = dst->src[5];
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -8154,13 +8155,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // cm2 dense is fast, so it needs a larger reduction to win.
     // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
     const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : (kv_f16 ? 2 : 16);
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = indices || (!disable_sparse && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             // the cm2 sparse gather only reads f16
                             (kv_f16 || tuning_params.path != FA_COOPMAT2) &&
                             nem0 == KV &&
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
-                            (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
+                            (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1)));
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -8351,13 +8352,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Sparse index scratch reuses prealloc_y (mutually exclusive with mask opt).
-    const uint64_t sparse_idx_size = use_sparse
+    const uint64_t sparse_idx_size = use_sparse && !indices
         ? sizeof(int32_t) * (uint64_t)n_kv_max * nem1 * nem2 * nem3
         : 0;
     vk_pipeline sparse_compact_pipeline = ctx->device->fa_sparse_compact_use_subgroups
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
         : ctx->device->pipeline_fa_sparse_compact;
-    if (use_sparse) {
+    if (use_sparse && !indices) {
         ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
         if (ctx->prealloc_size_y < sparse_idx_size) {
             ctx->prealloc_size_y = sparse_idx_size;
@@ -8380,8 +8381,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    if (use_mask_opt || use_sparse) {
+    vk_subbuffer sparse_buf = indices ? ggml_vk_tensor_subbuffer(ctx, indices) :
+                              use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    if (use_mask_opt || (use_sparse && !indices)) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -8437,7 +8439,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    if (use_sparse)
+    if (use_sparse && !indices)
     {
         const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
             KV,
@@ -8570,7 +8572,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || use_sparse) {
+    if (use_mask_opt || (use_sparse && !indices)) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -15483,6 +15485,35 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
+                if (const ggml_tensor * indices = op->src[5]) {
+                    const ggml_tensor * q = op->src[0];
+                    const ggml_tensor * k = op->src[1];
+                    const ggml_tensor * v = op->src[2];
+                    const ggml_tensor * mask = op->src[3];
+                    float max_bias, softcap;
+                    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+                    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
+                    if (indices->type != GGML_TYPE_I32 || !ggml_is_contiguous(indices) ||
+                            indices->ne[0] <= 0 || indices->ne[0] != ggml_get_op_params_i32(op, 4) ||
+                            indices->ne[1] != q->ne[1] || indices->ne[2] != 1 || indices->ne[3] != 1 ||
+                            q->ne[1] > 8 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+                            !mask || mask->ne[0] != k->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                            max_bias != 0.0f || softcap != 0.0f) {
+                        return false;
+                    }
+                    // Match the existing sparse shader's GQA dispatch and supported K/V types.
+                    const bool f32acc = !device->fp16 || op->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
+                    auto tuning = get_fa_tuning_params(device, HSK, HSV, 512, k->ne[1], k->type, v->type, f32acc);
+                    const uint32_t ratio = q->ne[2] / k->ne[2];
+                    const bool grouped = ratio > 1 && ratio <= std::min(tuning.block_rows, 32u) &&
+                                         ratio*k->ne[2] == q->ne[2] && k->ne[2] == v->ne[2];
+                    tuning = get_fa_tuning_params(device, HSK, HSV, grouped ? ratio : q->ne[1],
+                                                 k->ne[1], k->type, v->type, f32acc);
+                    if ((!grouped && !(tuning.path == FA_SCALAR && q->ne[1] == 1)) ||
+                            (tuning.path == FA_COOPMAT2 && (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16))) {
+                        return false;
+                    }
+                }
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
                     return false;
                 }
@@ -16163,11 +16194,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_flash_attn_indices") == 0) {
+        return (void *) ggml_backend_vk_device_supports_op;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

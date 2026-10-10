@@ -234,8 +234,9 @@ bool fa_kv_index(uint lin, out uint kv_col) {
             return false;
         }
         int idx = data_sparse[sparse_base + lin];
-        kv_col = idx >= 0 ? uint(idx) : 0;
-        return idx >= 0;
+        bool valid = idx >= 0 && uint(idx) < KV;
+        kv_col = valid ? uint(idx) : 0;
+        return valid;
     }
     kv_col = lin;
     return !KV_bounds_check || lin < KV;

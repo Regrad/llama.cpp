@@ -773,6 +773,21 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // Do not let an older plugin silently interpret indexed attention as dense attention.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        const ggml_tensor * indices = op->src[5];
+        const ggml_tensor * q = op->src[0];
+        if (!q || indices->type != GGML_TYPE_I32 || !ggml_is_contiguous(indices) ||
+                indices->ne[0] <= 0 || indices->ne[0] > INT32_MAX ||
+                indices->ne[0] != ggml_get_op_params_i32(op, 4) ||
+                indices->ne[1] != q->ne[1] || indices->ne[2] != 1 || indices->ne[3] != 1 ||
+                q->ne[3] != 1 || !op->src[1] || !op->src[2] ||
+                op->src[1]->ne[1] != op->src[2]->ne[1] ||
+                op->src[1]->ne[2] <= 0 || op->src[2]->ne[2] <= 0 ||
+                !ggml_backend_reg_get_proc_address(device->reg, "ggml_backend_flash_attn_indices")) {
+            return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
 

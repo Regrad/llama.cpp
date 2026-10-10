@@ -2512,6 +2512,13 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Optional unique K/V columns per query: contiguous I32 [n_selected, n_query], single batch.
+    // Negative or out-of-range columns are inactive; the ordinary mask still applies.
+    // Only backends advertising ggml_backend_flash_attn_indices support this extension.
+    GGML_API void ggml_flash_attn_ext_set_kv_indices(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
