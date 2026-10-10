@@ -888,15 +888,23 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
-        std::sort(reps.begin(), reps.end());
+        // At most P reps occupy the first P + K cells, so this prefix contains K free cells.
+        const int64_t n_cells = (int64_t) kv_size*n_stream_kv;
+        const int64_t n_prefix = std::min<int64_t>(n_cells, (int64_t) pool_end.size() + n_new_g - n_new);
+        std::vector<uint8_t> occupied(n_prefix, 0);
+        for (size_t i = 0; i < pool_end.size(); ++i) {
+            GGML_ASSERT(pcell[i] >= 0 && pcell[i] < n_cells);
+            if (pcell[i] < n_prefix) {
+                occupied[pcell[i]] = 1;
+            }
+        }
 
         int64_t pad_cell = 0;
         for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+            while (pad_cell < n_prefix && occupied[pad_cell]) {
                 ++pad_cell;
             }
-            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
+            GGML_ASSERT(pad_cell < n_prefix);
             for (uint32_t k = 0; k < kpool; ++k) {
                 nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
             }
@@ -923,13 +931,14 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_pos    p = ubatch->pos[i];
 
             T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
 
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+            std::fill(row, row + p0, drop);
             std::fill(row + p0, row + p0 + nv, keep);
+            std::fill(row + p0 + nv, row + n_pool, drop);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
