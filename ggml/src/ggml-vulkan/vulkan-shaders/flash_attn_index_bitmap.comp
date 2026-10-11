@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer I { int indices[]; };
+layout(binding = 1) buffer B { uint bits[]; };
+layout(push_constant) uniform parameter {
+    uint kv;
+    uint selected;
+    uint words;
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = row * p.words;
+    for (uint w = tid; w < p.words; w += gl_WorkGroupSize.x) {
+        bits[base + w] = 0;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (uint s = tid; s < p.selected; s += gl_WorkGroupSize.x) {
+        const int col = indices[row * p.selected + s];
+        if (col >= 0 && uint(col) < p.kv) {
+            atomicOr(bits[base + uint(col) / 32], 1u << (uint(col) % 32));
+        }
+    }
+}

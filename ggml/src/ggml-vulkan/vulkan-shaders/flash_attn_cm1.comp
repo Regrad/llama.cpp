@@ -152,6 +152,16 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (USE_INDEX_BITMAP && p.gqa_ratio > 1) {
+            const uint words = (p.KV + 31) / 32;
+            bool selected = false;
+            for (uint w = j * Bc / 32; w < min(CEIL_DIV((j + 1) * Bc, 32), words); ++w) {
+                selected = selected || data_sparse[gqa_iq1 * words + w] != 0;
+            }
+            if (!selected) {
+                continue;
+            }
+        }
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -180,7 +190,16 @@ void main() {
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active) {
                             f16vec4 m;
-                            if (USE_SPARSE) {
+                            if (USE_INDEX_BITMAP) {
+                                m = f16vec4(uintBitsToFloat(0xff800000u));
+                                for (uint rr = 0; rr < 4; ++rr) {
+                                    uint qr = p.gqa_ratio > 1 ? gqa_iq1 : i * Br + r * 4 + rr;
+                                    if (fa_selected(qr, kcol)) {
+                                        m[rr] = data_m[m_offset + qr * m_stride + kcol];
+                                        max_mask = max(max_mask, float(m[rr]));
+                                    }
+                                }
+                            } else if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);

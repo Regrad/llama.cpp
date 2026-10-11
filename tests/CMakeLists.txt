@@ -1,5 +1,10 @@
 llama_add_compile_flags()
 
+add_executable(test-qwen-ple-reader test-qwen-ple-reader.cpp)
+target_compile_features(test-qwen-ple-reader PRIVATE cxx_std_17)
+target_link_libraries(test-qwen-ple-reader PRIVATE ggml)
+add_test(NAME test-qwen-ple-reader COMMAND test-qwen-ple-reader)
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 

@@ -3234,6 +3234,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Fast ballot prefix-sum path when the device supports full subgroups; otherwise
         // a shared-memory prefix-sum fallback. Both emit a deterministic ascending list.
         device->fa_sparse_compact_use_subgroups = device->subgroup_ballot && device->subgroup_require_full_support;
+        ggml_vk_create_pipeline(device, device->pipeline_fa_index_bitmap, "fa_index_bitmap", fa_index_bitmap_len, fa_index_bitmap_data, "main", 2, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
         if (device->fa_sparse_compact_use_subgroups) {
             const uint32_t compact_wg = std::max(device->subgroup_size, (compact_max / device->subgroup_size) * device->subgroup_size);
             const uint32_t compact_num_sg = compact_wg / device->subgroup_size;
@@ -8105,7 +8106,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
+    const bool use_dequant_kv = !indices && k_quant && v_quant && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -8123,8 +8124,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+    const bool use_index_bitmap = indices && neq1 > 8 && tuning_params.path == FA_COOPMAT1;
+    const auto dense_tuning = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    const auto grouped_tuning = get_fa_tuning_params(ctx->device, HSK, HSV, qk_ratio, KV, k_type_eff, v_type_eff, f32acc);
+    const bool bitmap_gqa = use_index_bitmap && dense_tuning.block_rows == grouped_tuning.block_rows &&
+                           dense_tuning.block_cols == grouped_tuning.block_cols && dense_tuning.path == grouped_tuning.path;
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    if ((N <= 8 || (indices && !use_index_bitmap) || bitmap_gqa) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -8155,7 +8161,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // cm2 dense is fast, so it needs a larger reduction to win.
     // With quantized K/V, sparse only breaks even around 16x (measured on RDNA3/RDNA4).
     const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : (kv_f16 ? 2 : 16);
-    const bool use_sparse = indices || (!disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = (indices && !use_index_bitmap) || (!indices && !disable_sparse && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             // the cm2 sparse gather only reads f16
                             (kv_f16 || tuning_params.path != FA_COOPMAT2) &&
@@ -8196,10 +8202,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !use_sparse && !use_index_bitmap && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (use_index_bitmap) {
+        fa_pipeline_state.flags |= 32u;
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -8258,6 +8267,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
+    } else if (use_index_bitmap) {
+        // Keep the original dense partition boundaries when grouping heads per query.
+        const uint32_t dense_wgs = CEIL_DIV((uint32_t)neq1, dense_tuning.block_rows) * (uint32_t)neq2 * workgroups_z;
+        if (dense_wgs < shader_core_count * 2) {
+            split_k = shader_core_count * 2 / dense_wgs;
+        }
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
@@ -8352,14 +8367,18 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Sparse index scratch reuses prealloc_y (mutually exclusive with mask opt).
-    const uint64_t sparse_idx_size = use_sparse && !indices
+    const uint32_t bitmap_words = CEIL_DIV(KV, 32);
+    const uint64_t sparse_idx_size = use_index_bitmap ? sizeof(uint32_t) * (uint64_t)bitmap_words * nem1 : use_sparse && !indices
         ? sizeof(int32_t) * (uint64_t)n_kv_max * nem1 * nem2 * nem3
         : 0;
     vk_pipeline sparse_compact_pipeline = ctx->device->fa_sparse_compact_use_subgroups
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
         : ctx->device->pipeline_fa_sparse_compact;
-    if (use_sparse && !indices) {
-        ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
+    if (use_index_bitmap || (use_sparse && !indices)) {
+        if (sparse_idx_size > ctx->device->properties.limits.maxStorageBufferRange) {
+            GGML_ABORT("Requested sparse attention scratch is too large");
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, use_index_bitmap ? ctx->device->pipeline_fa_index_bitmap : sparse_compact_pipeline, 1);
         if (ctx->prealloc_size_y < sparse_idx_size) {
             ctx->prealloc_size_y = sparse_idx_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -8381,9 +8400,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = indices ? ggml_vk_tensor_subbuffer(ctx, indices) :
+    vk_subbuffer sparse_buf = use_index_bitmap ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : indices ? ggml_vk_tensor_subbuffer(ctx, indices) :
                               use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    if (use_mask_opt || (use_sparse && !indices)) {
+    if (use_mask_opt || use_index_bitmap || (use_sparse && !indices)) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
@@ -8436,6 +8455,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
                                   { mask_buf, mask_opt_buf }, opt_pc,
                                   { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    if (use_index_bitmap) {
+        const std::vector<uint32_t> bitmap_pc = { KV, (uint32_t)indices->ne[0], bitmap_words };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_index_bitmap,
+                                  { ggml_vk_tensor_subbuffer(ctx, indices), sparse_buf }, bitmap_pc, { nem1, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -8572,7 +8598,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_dequant_kv) {
         ctx->prealloc_x_need_sync = true;
     }
-    if (use_mask_opt || (use_sparse && !indices)) {
+    if (use_mask_opt || use_index_bitmap || (use_sparse && !indices)) {
         ctx->prealloc_y_need_sync = true;
     }
 }
@@ -15496,8 +15522,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (indices->type != GGML_TYPE_I32 || !ggml_is_contiguous(indices) ||
                             indices->ne[0] <= 0 || indices->ne[0] != ggml_get_op_params_i32(op, 4) ||
                             indices->ne[1] != q->ne[1] || indices->ne[2] != 1 || indices->ne[3] != 1 ||
-                            q->ne[1] > 8 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
-                            !mask || mask->ne[0] != k->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                            q->ne[1] <= 0 || q->ne[1] > 1024 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+                            !mask || mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
                             max_bias != 0.0f || softcap != 0.0f) {
                         return false;
                     }

@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "qwen4exp-ple-reader.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -213,6 +214,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        const char * direct = getenv("LLAMA_PLE_DIRECT_READ");
+        if (!ml.no_alloc && direct && strcmp(direct, "1") == 0 && ml.lazy.has(per_layer_tok_embd)) {
+            const auto * weight = ml.get_weight(ple_name.c_str());
+            if (!weight || weight->idx >= ml.files.size()) {
+                throw std::runtime_error("PLE direct reader has no backing file");
+            }
+            const auto & file = ml.files[weight->idx];
+            ple_reader = std::make_shared<llama_qwen_ple_reader>(file->file_id(), file->size(),
+                    weight->offs, per_layer_tok_embd);
+            LLAMA_LOG_INFO("%s: PLE direct reads enabled, 16 workers\n", __func__);
+        }
     }
 
     auto load_block = [&](int il, int flags) {
@@ -949,7 +961,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     ggml_tensor * sel_idx = nullptr;
     bool use_indices = false;
-    if (qsa && cparams.flash_attn && n_tokens <= 8 &&
+    if (qsa && cparams.flash_attn && n_tokens <= 1024 &&
             !getenv("LLAMA_QSA_INDICES_DISABLE") && !getenv("GGML_VK_FA_SPARSE_DISABLE")) {
         ggml_backend_dev_t dev = model.dev_layer(il);
         if (dev && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0) {
@@ -1238,10 +1250,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n_rows = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return direct_rows ? direct_rows->ne[1] == n_rows : rows->ne[0] == n_rows;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * direct_rows = nullptr; // F32 [ple_head_dim, ple_n_heads * n_tokens]
+    std::shared_ptr<llama_qwen_ple_reader> reader;
+    std::vector<float> staged;
 
     const llama_model & model;
 
@@ -1311,6 +1327,33 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (reader) {
+        reader->gather(idx, staged);
+        const char * verify = getenv("LLAMA_PLE_DIRECT_VERIFY");
+        if (verify && strcmp(verify, "1") == 0) {
+            const auto * table = model.per_layer_tok_embd;
+            const auto decode = ggml_get_type_traits(table->type)->to_float;
+            std::vector<float> reference(table->ne[0]);
+            for (size_t i = 0; i < idx.size(); ++i) {
+                const void * packed = (const char *) table->data + (size_t) idx[i] * table->nb[1];
+                if (table->type == GGML_TYPE_F32) {
+                    memcpy(reference.data(), packed, reference.size() * sizeof(float));
+                } else {
+                    decode(packed, reference.data(), table->ne[0]);
+                }
+                if (memcmp(reference.data(), staged.data() + i * reference.size(), reference.size() * sizeof(float))) {
+                    throw std::runtime_error("PLE direct rows differ from the mapped table");
+                }
+            }
+            if (ubatch->n_tokens > 8) {
+                LLAMA_LOG_INFO("PLE direct rows verified against mmap: %zu rows, %u tokens\n",
+                        idx.size(), (unsigned) ubatch->n_tokens);
+            }
+        }
+        ggml_backend_tensor_set(direct_rows, staged.data(), 0, ggml_nbytes(direct_rows));
+        return;
     }
 
     {
@@ -1388,13 +1431,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    ple_inp->reader = static_cast<const llama_model_qwen4exp &>(model).ple_reader;
+    ggml_tensor * emb;
+    if (ple_inp->reader) {
+        ple_inp->direct_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->direct_rows);
+        ggml_set_name(ple_inp->direct_rows, "ple_direct_rows");
+        emb = ple_inp->direct_rows;
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
+    }
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

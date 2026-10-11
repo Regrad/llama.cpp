@@ -11469,6 +11469,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_flash_attn_indices(type, 3, 200000));
+        for (int64_t queries : {int64_t(9), int64_t(33), int64_t(128), int64_t(1024)}) {
+            test_cases.emplace_back(new test_flash_attn_indices(type, queries, 4096));
+        }
+        test_cases.emplace_back(new test_flash_attn_indices(type, 33, 65536));
+        for (int64_t queries : {9, 17, 33}) {
+            test_cases.emplace_back(new test_flash_attn_indices(type, queries, 1056));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     // quantized cache, deep enough to take the sparse path

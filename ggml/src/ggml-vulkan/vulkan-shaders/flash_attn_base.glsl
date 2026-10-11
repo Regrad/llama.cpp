@@ -26,6 +26,8 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// Keep the dense reduction layout; binding 7 holds selected-column bits per query.
+const bool USE_INDEX_BITMAP = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -85,6 +87,14 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
+bool fa_selected(uint row, uint col) {
+    if (row >= p.nem1 || col >= p.KV) {
+        return false;
+    }
+    uint word = row * ((p.KV + 31) / 32) + col / 32;
+    return (uint(data_sparse[word]) & (1u << (col % 32))) != 0;
+}
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2

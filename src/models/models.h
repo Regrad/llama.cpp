@@ -2501,10 +2501,13 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 
+class llama_qwen_ple_reader;
+
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_kpool;
+    std::shared_ptr<llama_qwen_ple_reader> ple_reader;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

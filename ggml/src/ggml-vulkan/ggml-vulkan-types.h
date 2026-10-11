@@ -1007,6 +1007,7 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_fa_sparse_compact;
+    vk_pipeline pipeline_fa_index_bitmap;
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
     bool fa_sparse_compact_use_subgroups;
 
