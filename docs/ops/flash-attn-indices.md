@@ -16,9 +16,9 @@ The backend registry must expose a non-null capability token named
 not be called. Older plugins and other backends are rejected for this form of FA,
 preventing silent dense attention when loading the original CPU plugins.
 The Qwen graph probes the selected Vulkan device before using the extension and
-otherwise builds the original mask path. Prefill and multi-stream graphs are unchanged.
+otherwise builds the original mask path. There is no minimum KV length for supported decode graphs. Large prefill and multi-stream graphs are unchanged.
 
 `test_flash_attn_indices` checks against both CPU and independently constructed
 dense selection masks. It covers F16/Q8_0, strided K/V cache views, 1/3/8 queries,
-65536/200000 columns, the full 2051 slots, dead sentinels, the incomplete tail and
+256/1024/4096/65536/200000 columns, up to 2051 slots, dead sentinels, the incomplete tail and
 causal exclusion of a selected column. These are correctness checks, not benchmarks.

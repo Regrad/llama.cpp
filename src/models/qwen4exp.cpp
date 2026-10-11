@@ -949,7 +949,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     ggml_tensor * sel_idx = nullptr;
     bool use_indices = false;
-    if (qsa && cparams.flash_attn && n_tokens <= 8 && inp_kpool->n_kv >= 65536 &&
+    if (qsa && cparams.flash_attn && n_tokens <= 8 &&
             !getenv("LLAMA_QSA_INDICES_DISABLE") && !getenv("GGML_VK_FA_SPARSE_DISABLE")) {
         ggml_backend_dev_t dev = model.dev_layer(il);
         if (dev && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0) {

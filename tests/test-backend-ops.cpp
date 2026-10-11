@@ -8224,7 +8224,7 @@ struct test_flash_attn_ext : public test_case {
 struct test_flash_attn_indices : public test_flash_attn_ext {
     test_flash_attn_indices(ggml_type type, int64_t queries, int64_t kv_size = 65536)
         : test_flash_attn_ext(256, 256, 2, {12, 1}, kv_size, queries, true, false, 0, 0,
-                GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, 2051) {}
+                GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, std::min<int64_t>(kv_size, 2048) + 3) {}
 
     std::string vars() override {
         return test_flash_attn_ext::vars() + ",direct_indices=1";
@@ -8256,6 +8256,9 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
                     continue; // invisible four-cell pools, including a fully inactive tile
                 }
                 const int32_t col = (int32_t) ((31*(n_kv_max - 4 - slot) + 17*query) % kv);
+                if (col == kv - 1) {
+                    continue; // the tail is added once below
+                }
                 columns[query*n_kv_max + slot] = col;
                 mask_dense[query*kv + col] = ggml_fp32_to_fp16(0.0f);
             }
@@ -11461,6 +11464,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int64_t queries : {1, 3, 8}) {
             test_cases.emplace_back(new test_flash_attn_indices(type, queries));
+            for (int64_t kv_size : {256, 1024, 4096}) {
+                test_cases.emplace_back(new test_flash_attn_indices(type, queries, kv_size));
+            }
         }
         test_cases.emplace_back(new test_flash_attn_indices(type, 3, 200000));
     }
