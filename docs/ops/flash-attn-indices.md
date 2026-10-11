@@ -41,6 +41,14 @@ Regression checks include partial query tiles and a KV length not divisible by
 64. Captured-operation replay additionally requires bitwise agreement with the
 pre-prefill runtime; generic cross-backend tests use their numerical tolerance.
 
+# Local Qwen MTP cache-only catch-up
+
+The single-layer Qwen4Exp MTP graph can omit its unused output when a batch requests zero outputs, training and embedding output are off, and next-token hidden export is disabled or masked. Catch-up uses the target's hidden states, not the omitted draft result. Attention K/V writes and indexer raw/pooled-key writes keep their original projections, normalization, rotations and storage operations. The graph does not compute query scores, attention, the FFN or the output head for these batches. Batches that request outputs keep the full graph, and graph reuse already distinguishes output counts.
+
+This does not shorten the draft attention window or change speculative acceptance. Validate complete token streams with MTP enabled, including transitions from prompt catch-up to drafting and verification.
+
+The hybrid input still fills its attention mask, so cache-only graphs retain that input allocation. The graph allocator must also validate the sizes of unused input leaves when reusing allocations: pooled masks can grow with the cache even when no computed node reads them. `test_unused_input_growth` covers repeated growth and shrinkage with single- and multi-buffer allocators.
+
 # Local Qwen PLE positional reader
 
 `LLAMA_PLE_DIRECT_READ=1` enables the private reader for a lazily mapped Qwen4Exp PLE table. Other models, resident tables and the default environment are unchanged. It keeps 16 workers, deduplicates requested rows, orders them by file offset and reads only their packed bytes. Windows uses `ReOpenFile` and buffered overlapped `ReadFile` with a separate event for each worker; POSIX uses `pread`. This is not unbuffered sector I/O and does not disable the OS file cache.

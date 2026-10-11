@@ -1021,6 +1021,13 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
+    // Unused graph inputs are not checked through any node's sources.
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, graph->leafs[i], &galloc->leaf_allocs[i].leaf)) {
+            return true;
+        }
+    }
+
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];

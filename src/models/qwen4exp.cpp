@@ -585,8 +585,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
+    // Catch-up reads target hidden states; no draft output is consumed when all output flags are clear.
+    const bool cache_only = n_outputs == 0 && !cparams.training && !cparams.embeddings &&
+                            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = cache_only ? nullptr : build_inp_out_ids();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -600,7 +603,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
-    cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+    cur = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il, cache_only);
+    if (cache_only) {
+        // The hybrid input fills this mask even when attention is not evaluated.
+        ggml_build_forward_expand(gf, inp_hyb->get_attn()->get_kq_mask());
+        return;
+    }
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
@@ -755,7 +763,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           kq_mask,
         ggml_tensor **                          sel_idx_out,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    cache_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim = hparams.indexer_head_size;
@@ -800,6 +809,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+    if (cache_only) {
+        return nullptr;
+    }
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
@@ -952,7 +964,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        bool                      cache_only) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -986,7 +999,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         }
     }
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(),
-            use_indices ? &sel_idx : nullptr, sections, il) : nullptr;
+            use_indices ? &sel_idx : nullptr, sections, il, cache_only) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1035,6 +1048,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    if (cache_only) {
+        if (inp->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+        }
+        if (inp->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+        return nullptr;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

@@ -427,13 +427,33 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
+        // A stale suffix can regroup pools without changing the cell count.
         if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
-            sq.cells.assign(sp.begin(), sp.end());
-            sq.pools.clear();
-            sq.j_next  = 0;
-            sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
+            bool keep_prefix = hparams_idx.indexer_kpool_by_order && !sq.cells.empty() && !sp.empty() &&
+                sq.pos_min == sp.begin()->first && mem_idx_stale[s] > sq.pos_min && mem_idx_stale[s] != POS_CLEAN;
+
+            if (keep_prefix) {
+                const auto key = std::make_pair(mem_idx_stale[s], 0u);
+                const size_t n_keep = std::lower_bound(sq.cells.begin(), sq.cells.end(), key) - sq.cells.begin();
+                sq.cells.resize(n_keep);
+                for (auto it = sp.lower_bound(key); it != sp.end(); ++it) {
+                    sq.cells.push_back(*it);
+                }
+
+                // Cache eviction can also remove cells before the stale suffix.
+                keep_prefix = sq.cells.size() == sp.size();
+                if (keep_prefix) {
+                    sq.pools.resize(std::min(sq.pools.size(), n_keep/kpool));
+                    sq.j_next = sq.pools.size()*kpool;
+                }
+            }
+
+            if (!keep_prefix) {
+                sq.cells.assign(sp.begin(), sp.end());
+                sq.pools.clear();
+                sq.j_next  = 0;
+                sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
+            }
         }
 
         // Pools start at the first valid token

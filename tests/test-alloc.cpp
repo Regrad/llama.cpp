@@ -642,6 +642,38 @@ static void test_reallocation() {
     }
 }
 
+static void test_unused_input_growth(bool multiple_buffers) {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, multiple_buffers ? 2 : 1));
+    for (size_t size : { size_t(8), size_t(128), size_t(32), size_t(256) }) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * unused = make_input_with_size(ctx, size);
+        ggml_tensor * input = make_input_with_size(ctx, 16);
+        ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, unused);
+        ggml_build_forward_expand(graph, output);
+        GGML_ASSERT(graph->n_nodes == 1 && graph->n_leafs == 2);
+        if (multiple_buffers) {
+            if (!ggml_gallocr_alloc_graph(galloc.get(), graph)) {
+                const int node_buffer_ids[] = { 0 };
+                const int leaf_buffer_ids[] = { 0, 0 };
+                GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+                GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+            }
+        } else {
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        }
+        const uintptr_t unused_end = (uintptr_t) unused->data + ggml_nbytes(unused);
+        const uintptr_t input_end = (uintptr_t) input->data + ggml_nbytes(input);
+        GGML_ASSERT(unused->buffer != input->buffer || unused_end <= (uintptr_t) input->data ||
+                    input_end <= (uintptr_t) unused->data);
+        GGML_ASSERT(unused_end <= (uintptr_t) ggml_backend_buffer_get_base(unused->buffer) +
+                    ggml_backend_buffer_get_size(unused->buffer));
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1152,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unused_input_growth(single)", []() { test_unused_input_growth(false); });
+    run("test_unused_input_growth(multiple)", []() { test_unused_input_growth(true); });
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
