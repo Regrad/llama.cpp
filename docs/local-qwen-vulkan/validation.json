@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-12",
+  "base_commit": "4d756bc72bf00a4aacf410ae15a2d315f3db400d",
+  "latest_fix_parent": "398e8b4c32d6e0625ede68b2c6312ea087a8b6c0",
+  "latest_fix_commit": "f45a52d6a98f86abbdce2902589b239e51a567aa",
+  "model": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "device": "AMD Radeon 8060S, Vulkan",
+  "sampling": {"temperature": 0, "top_k": 1, "seed": 42},
+  "mtp2_vs_mtp3": {"input_variants": 2, "requests_per_mode": 9, "token_pairs": 6400, "all_equal": true, "maximum_output_tokens_per_request": 1024},
+  "backend_checks": {"passed": 58, "total": 58, "reference": "CPU", "kv_types": ["f16", "q8_0"], "maximum_kv_columns": 200000},
+  "batch_invariance": {"tests": 16, "previous_vulkan_passed": 0, "fixed_vulkan_passed": 16, "bitwise": true},
+  "installed_runtime_smoke_equal_tokens": 128,
+  "remaining_limitation": {"case": "full cold recomputation versus warm history continuation", "equal": false, "first_difference_one_based": 2, "cold_token": 466, "cached_token": 271, "cause_proven": false},
+  "earlier_performance_checks": {
+    "context_tokens": 200000,
+    "prefill_tokens_per_second": {"before": 200.81286235300425, "after": 307.635723},
+    "decode_tokens_per_second": {"before": 23.354893, "after": 36.947},
+    "output_token_ids_equal": 318,
+    "incremental_layout_regression_comparisons": 194735,
+    "address_sanitizer": "passed",
+    "latest_mtp_fix_throughput_measured": false
+  },
+  "installed_dll_sha256": {
+    "llama.dll": "A4AA002B8414AEDC882F35C6B1C3911209BA275BC053E4E5437ED05F3B30F887",
+    "llama-common.dll": "47F32598DFE4D93745E9D8D1F148226F9B6925C17798C89A9988DC6941E7CC43",
+    "ggml-vulkan.dll": "FD691471E2CEF8C1C3C75838DC073139E71A3879BC279DF42B659BFE4A87F37E",
+    "ggml-base.dll": "9DAFEE3F403626ACAEA7ED999EB3E44D4123ED62EC2291403E37DE63514817E8"
+  },
+  "configured_runtime_mtp_draft_length": 3,
+  "universal_token_equivalence_claimed": false,
+  "publication_checks_reran_inference": false
+}

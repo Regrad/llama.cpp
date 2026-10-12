@@ -1,5 +1,7 @@
 # llama.cpp
 
+Local Qwen Flash Next Vulkan work: [changes, measurements, build instructions and known limitations](docs/local-qwen-vulkan/README.md). This branch includes experimental optimizations and MTP consistency fixes; cold-prefill versus warm-continuation equivalence remains unresolved.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
