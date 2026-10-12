@@ -1515,6 +1515,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.clear();
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (is_mem_shared || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const auto & h = pending_h[seq_id];
+        data.resize(h.size() * sizeof(float));
+        std::memcpy(data.data(), h.data(), data.size());
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (is_mem_shared || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        auto & h = pending_h[seq_id];
+        if (data.size() != h.size() * sizeof(float)) {
+            return;
+        }
+
+        // Restore the hidden row that precedes the next prefill batch.
+        std::memcpy(h.data(), data.data(), data.size());
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
@@ -1584,6 +1609,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+
+                // A new sequence has no preceding target hidden state.
+                if (batch_in.tokens[k].pos[0] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()

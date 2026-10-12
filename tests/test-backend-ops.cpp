@@ -8222,12 +8222,15 @@ struct test_flash_attn_ext : public test_case {
 
 // Indexed QSA must agree with an independently constructed dense selection mask on both backends.
 struct test_flash_attn_indices : public test_flash_attn_ext {
-    test_flash_attn_indices(ggml_type type, int64_t queries, int64_t kv_size = 65536)
+    const bool check_batch;
+
+    test_flash_attn_indices(ggml_type type, int64_t queries, int64_t kv_size = 65536, bool check_batch = false)
         : test_flash_attn_ext(256, 256, 2, {12, 1}, kv_size, queries, true, false, 0, 0,
-                GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, std::min<int64_t>(kv_size, 2048) + 3) {}
+                GGML_PREC_F32, type, type, {0, 2, 1, 3}, true, false, (check_batch ? 2048 : std::min<int64_t>(kv_size, 2048)) + 3),
+          check_batch(check_batch) {}
 
     std::string vars() override {
-        return test_flash_attn_ext::vars() + ",direct_indices=1";
+        return test_flash_attn_ext::vars() + ",direct_indices=1,check_batch=" + std::to_string(check_batch);
     }
 
     bool run_whole_graph() override { return true; }
@@ -8237,6 +8240,20 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
         ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv_max, nb);
         ggml_set_name(indices, "indices");
         ggml_flash_attn_ext_set_kv_indices(indexed, indices);
+        if (check_batch) {
+            ggml_tensor * q = indexed->src[0];
+            ggml_tensor * m = indexed->src[3];
+            ggml_tensor * q_one = ggml_view_4d(ctx, q, q->ne[0], 1, q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], 0);
+            ggml_tensor * m_one = ggml_view_2d(ctx, m, kv, 1, m->nb[1], 0);
+            ggml_tensor * i_one = ggml_view_2d(ctx, indices, n_kv_max, 1, indices->nb[1], 0);
+            ggml_tensor * one = ggml_flash_attn_ext(ctx, q_one, indexed->src[1], indexed->src[2],
+                    m_one, 1.0f/sqrtf(hsk), 0.0f, 0.0f);
+            ggml_prec_set_acc(one, prec);
+            ggml_flash_attn_ext_set_kv_indices(one, i_one);
+            ggml_tensor * first = ggml_view_4d(ctx, indexed, hsv, nh*nr23[0], 1, 1,
+                    indexed->nb[1], indexed->nb[2], indexed->nb[3], 0);
+            return ggml_concat(ctx, first, one, 0);
+        }
         ggml_tensor * dense_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
         ggml_set_name(dense_mask, "dense_mask");
         ggml_tensor * dense = ggml_flash_attn_ext(ctx, indexed->src[0], indexed->src[1], indexed->src[2],
@@ -8251,7 +8268,7 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
         std::vector<ggml_fp16_t> mask_causal(kv*nb, ggml_fp32_to_fp16(0.0f));
         std::vector<ggml_fp16_t> mask_dense(kv*nb, ggml_fp32_to_fp16(-INFINITY));
         for (int64_t query = 0; query < nb; ++query) {
-            for (int64_t slot = 0; slot < n_kv_max - 3; ++slot) {
+            for (int64_t slot = 0; slot < std::min(kv, n_kv_max - 3); ++slot) {
                 if (slot % 64 >= 60 || (query == 1 && slot < 64)) {
                     continue; // invisible four-cell pools, including a fully inactive tile
                 }
@@ -8272,6 +8289,9 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
             }
         }
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
             if (strcmp(t->name, "indices") == 0) {
                 ggml_backend_tensor_set(t, columns.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "m") == 0) {
@@ -8286,7 +8306,7 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
 
     double err(const float * a, const float * b, size_t n) override {
         double result = nmse(a, b, n);
-        if (n == (size_t) (2*hsv*nh*nr23[0]*nb)) {
+        if (n == (size_t) (2*hsv*nh*nr23[0]*(check_batch ? 1 : nb))) {
             std::vector<float> indexed_a(n/2), dense_a(n/2), indexed_b(n/2), dense_b(n/2);
             for (size_t row = 0; row < n/(2*hsv); ++row) {
                 for (int64_t i = 0; i < hsv; ++i) {
@@ -8298,6 +8318,10 @@ struct test_flash_attn_indices : public test_flash_attn_ext {
             }
             result = std::max(result, nmse(indexed_a.data(), dense_a.data(), n/2));
             result = std::max(result, nmse(indexed_b.data(), dense_b.data(), n/2));
+            if (check_batch && (std::memcmp(indexed_a.data(), dense_a.data(), n/2*sizeof(float)) != 0 ||
+                                std::memcmp(indexed_b.data(), dense_b.data(), n/2*sizeof(float)) != 0)) {
+                return INFINITY;
+            }
         }
         return result;
     }
@@ -11462,6 +11486,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t queries : {2, 3, 4, 8}) {
+            for (int64_t kv_size : {512, 65536}) {
+                test_cases.emplace_back(new test_flash_attn_indices(type, queries, kv_size, true));
+            }
+        }
         for (int64_t queries : {1, 3, 8}) {
             test_cases.emplace_back(new test_flash_attn_indices(type, queries));
             for (int64_t kv_size : {256, 1024, 4096}) {

@@ -862,7 +862,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // Feed the same selected columns to native Vulkan FA without scattering and re-scanning a dense mask.
     if (sel_idx_out) {
         ggml_tensor * idx_live = ggml_scale_bias(ctx0, ggml_cast(ctx0, sel_idx, GGML_TYPE_F32), 1.0f, 1.0f);
-        idx_live = ggml_scale_bias(ctx0, ggml_mul(ctx0, idx_live, live), 1.0f, -1.0f);
+        idx_live = ggml_mul(ctx0, idx_live, live);
+        // Keep the tail at the same slot when the pool cache grows between verify batches.
+        const int64_t n_padding = hparams.indexer_top_k - kpool*n_top_pool;
+        if (n_padding > 0) {
+            ggml_tensor * pools = ggml_view_2d(ctx0, idx_live, kpool*n_top_pool, n_tokens, idx_live->nb[1], 0);
+            ggml_tensor * tail = ggml_view_2d(ctx0, idx_live, kpool - 1, n_tokens, idx_live->nb[1],
+                    kpool*n_top_pool*ggml_element_size(idx_live));
+            idx_live = ggml_concat(ctx0, ggml_pad(ctx0, pools, n_padding, 0, 0, 0), tail, 0);
+        }
+        idx_live = ggml_scale_bias(ctx0, idx_live, 1.0f, -1.0f);
         *sel_idx_out = ggml_cast(ctx0, idx_live, GGML_TYPE_I32);
         cb(*sel_idx_out, "indexer_sel_idx", il);
         return kq_mask;

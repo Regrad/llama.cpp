@@ -8259,7 +8259,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_sparse) {
         split_kv = (uint32_t)n_kv_max;
         const uint32_t total_blocks = CEIL_DIV((uint32_t)n_kv_max, Bc);
-        const uint32_t base_wgs = (gqa_ratio > 1 ? workgroups_x : Tr) * workgroups_y * workgroups_z;
+        // Native indices use a fixed query occupancy target so MTP batch size does not change the reduction tree.
+        const uint32_t query_wgs = indices ? 4u : (gqa_ratio > 1 ? workgroups_x : Tr);
+        const uint32_t base_wgs = query_wgs * workgroups_y * workgroups_z;
         if (base_wgs < shader_core_count * 2) {
             split_k = shader_core_count * 2 / base_wgs;
         }
